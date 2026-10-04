@@ -392,6 +392,59 @@ router.post('/generate', async function (req, res) {
     }
 });
 
+/**
+ * One-shot, non-streaming chat completion against GLM-4.6 / Xialong, for helper tasks
+ * like memory extraction that need instructions rather than story continuation.
+ */
+router.post('/chat-completion', async function (req, res) {
+    const apiKey = readSecret(req.user.directories, SECRET_KEYS.NOVEL);
+    if (!apiKey) {
+        return res.status(400).send({ error: { message: 'NovelAI API key is missing.' } });
+    }
+
+    const model = ['glm-4-6', 'xialong-v1'].includes(req.body?.model) ? req.body.model : 'xialong-v1';
+    const messages = Array.isArray(req.body?.messages)
+        ? req.body.messages.filter(m => ['system', 'user', 'assistant'].includes(m?.role) && typeof m?.content === 'string')
+        : [];
+    if (!messages.length) {
+        return res.status(400).send({ error: { message: 'No messages.' } });
+    }
+
+    const logitBias = {};
+    if (req.body.ban_ai_punctuation) {
+        for (const id of GLM_AI_PUNCTUATION_TOKENS) {
+            logitBias[id] = -100;
+        }
+    }
+
+    try {
+        const response = await fetch(`${TEXT_NOVELAI}/oa/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
+            body: JSON.stringify({
+                model,
+                messages,
+                // Non-streamed responses come back without text; collect the stream instead
+                stream: true,
+                max_tokens: Math.min(Math.max(Number(req.body.max_tokens) || 600, 16), 2048),
+                temperature: Math.min(Math.max(Number(req.body.temperature ?? 0.3), 0), 2),
+                logit_bias: Object.keys(logitBias).length ? logitBias : undefined,
+            }),
+        });
+
+        if (!response.ok) {
+            const text = await response.text();
+            console.warn(`NovelAI chat completion failed: ${response.status} ${text}`);
+            return res.status(response.status).send({ error: { message: text } });
+        }
+
+        return res.send({ output: await collectChatCompletionDeltas(response) });
+    } catch (error) {
+        console.error('NovelAI chat completion error', error);
+        return res.status(500).send({ error: { message: String(error) } });
+    }
+});
+
 router.post('/generate-image', async (request, response) => {
     if (!request.body) {
         return response.sendStatus(400);

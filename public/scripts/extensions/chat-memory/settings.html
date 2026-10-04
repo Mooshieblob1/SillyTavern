@@ -1,0 +1,48 @@
+<div class="chat_memory_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Chat Memory (NovelAI)</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <small class="justifyLeft">NovelAI reads recent messages and saves new events and facts as lorebook entries that stay in the prompt. Edit or delete them in World Info like any other entry.</small>
+            <label class="checkbox_label" for="chat_memory_auto">
+                <input id="chat_memory_auto" type="checkbox" />
+                <span>Save memories automatically</span>
+            </label>
+            <label for="chat_memory_interval">
+                <small>Check every N new messages</small>
+            </label>
+            <input id="chat_memory_interval" class="text_pole" type="number" min="2" max="50" step="1" />
+            <label for="chat_memory_scope">
+                <small>Save new memories to</small>
+            </label>
+            <select id="chat_memory_scope" class="text_pole">
+                <option value="auto">Let NovelAI decide (events to chat, lasting facts to character)</option>
+                <option value="chat">This chat</option>
+                <option value="character">This character (shared by all their chats)</option>
+            </select>
+            <label for="chat_memory_model">
+                <small>Model</small>
+            </label>
+            <select id="chat_memory_model" class="text_pole">
+                <option value="xialong-v1">Xialong (faster, more accurate in testing)</option>
+                <option value="glm-4-6">GLM-4.6</option>
+            </select>
+            <label class="checkbox_label" for="chat_memory_show_button">
+                <input id="chat_memory_show_button" type="checkbox" />
+                <span>Show "Remember now" button next to Send</span>
+            </label>
+            <label class="checkbox_label" for="chat_memory_notify">
+                <input id="chat_memory_notify" type="checkbox" />
+                <span>Show a notification when memories are saved</span>
+            </label>
+            <div class="flex-container">
+                <div id="chat_memory_run" class="menu_button menu_button_icon"><i class="fa-solid fa-brain"></i><span>Remember now</span></div>
+                <div id="chat_memory_open_chat" class="menu_button menu_button_icon"><i class="fa-solid fa-book"></i><span>Chat memories</span></div>
+                <div id="chat_memory_open_char" class="menu_button menu_button_icon"><i class="fa-solid fa-book-open"></i><span>Character memories</span></div>
+            </div>
+            <small id="chat_memory_status" class="justifyLeft"></small>
+        </div>
+    </div>
+</div>

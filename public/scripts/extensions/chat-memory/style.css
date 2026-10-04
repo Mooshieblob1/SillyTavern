@@ -1,0 +1,14 @@
+#chat_memory_button.chat_memory_running {
+    opacity: 0.5;
+    animation: chat_memory_pulse 1s ease-in-out infinite;
+}
+
+@keyframes chat_memory_pulse {
+    50% {
+        opacity: 1;
+    }
+}
+
+.chat_memory_settings select.text_pole {
+    width: 100%;
+}
