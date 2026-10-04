@@ -107,6 +107,21 @@ const EXPORTABLE_KEYS = [
 
 export const allowKeysExposure = !!getConfigValue('allowKeysExposure', false, 'boolean');
 
+// Environment variables used as a fallback when no secret is stored for the key
+const ENV_SECRET_FALLBACKS = {
+    [SECRET_KEYS.NOVEL]: 'NOVELAI_API_KEY',
+};
+
+/**
+ * Reads the environment fallback for a secret key.
+ * @param {string} key Secret key
+ * @returns {string} Environment value or empty string
+ */
+function getEnvSecret(key) {
+    const envName = ENV_SECRET_FALLBACKS[key];
+    return envName ? (process.env[envName] || '').trim() : '';
+}
+
 /**
  * SecretManager class to handle all secret operations
  */
@@ -267,7 +282,7 @@ export class SecretManager {
      */
     readSecret(key, id) {
         if (!fs.existsSync(this.filePath)) {
-            return '';
+            return id ? '' : getEnvSecret(key);
         }
 
         const secrets = this._readSecretsFile();
@@ -278,7 +293,7 @@ export class SecretManager {
             return activeSecret?.value || '';
         }
 
-        return '';
+        return id ? '' : getEnvSecret(key);
     }
 
     /**
@@ -358,6 +373,14 @@ export class SecretManager {
                     label: secret.label,
                     active: secret.active,
                 }));
+            } else if (getEnvSecret(key)) {
+                // Not stored, but provided through the environment
+                state[key] = [{
+                    id: 'env',
+                    value: this.getMaskedValue(getEnvSecret(key), key),
+                    label: `Environment (${ENV_SECRET_FALLBACKS[key]})`,
+                    active: true,
+                }];
             } else {
                 // No secrets for this key
                 state[key] = null;
