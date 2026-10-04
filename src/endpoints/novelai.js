@@ -6,6 +6,7 @@ import express from 'express';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
 import { readAllChunks, extractFileFromZipBuffer, forwardFetchResponse } from '../util.js';
+import { GLM_AI_PUNCTUATION_TOKENS } from './novelai-glm-punctuation.js';
 
 const API_NOVELAI = 'https://api.novelai.net';
 const TEXT_NOVELAI = 'https://text.novelai.net';
@@ -106,29 +107,54 @@ function getLogitBiasList(model) {
 }
 
 /**
- * GLM-4.6 and Xialong are plain OpenAI-compatible chat models, not NovelAI's classic
- * completion models. They don't have NovelAI's exotic samplers (Tail-Free Sampling,
- * Min-P, Top-A, repetition penalty/slope) to keep output coherent, so a preset tuned for
- * Clio/Kayra/Erato (which leans on those samplers and can leave temperature/top_p/top_k
- * wide open) produces degenerate, garbled output when forwarded as-is to the chat endpoint.
- * Clamp to safe defaults regardless of what preset is active.
- * @param {number} temperature Requested temperature
- * @param {number} top_p Requested top_p
- * @param {number} top_k Requested top_k
- * @returns {{temperature: number, top_p: number, top_k: number|undefined}} Clamped sampling parameters
+ * Builds a request for NovelAI's OpenAI-compatible text completion endpoint, used by
+ * GLM-4.6 and Xialong. The prompt is sent as raw text so the model continues the chat
+ * transcript the way it continues a story, and stop strings can end the turn.
+ *
+ * The endpoint is vLLM-style: NovelAI's exotic samplers (Tail-Free, Top-A, Mirostat,
+ * Math1) don't exist, and repetition penalty is multiplicative, so values from classic
+ * Clio/Kayra/Erato presets (e.g. 2.25) are clamped to a range that stays coherent.
+ * @param {any} body Request body from the client
+ * @returns {object} Completion request payload
  */
-function getChatSamplingParams(temperature, top_p, top_k) {
+function getGlmCompletionData(body) {
+    const clamp = (value, min, max, fallback) => (typeof value === 'number' && Number.isFinite(value))
+        ? Math.min(Math.max(value, min), max)
+        : fallback;
+
+    const stop = Array.isArray(body.stop_strings)
+        ? body.stop_strings.filter(s => typeof s === 'string' && s.length > 0).slice(0, 64)
+        : [];
+
+    const logitBias = {};
+    if (body.ban_ai_punctuation) {
+        for (const id of GLM_AI_PUNCTUATION_TOKENS) {
+            logitBias[id] = -100;
+        }
+    }
+
     return {
-        temperature: typeof temperature === 'number' ? Math.min(Math.max(temperature, 0), 1.25) : 0.8,
-        top_p: (typeof top_p === 'number' && top_p > 0 && top_p < 1) ? top_p : 0.9,
-        top_k: (typeof top_k === 'number' && top_k > 0) ? top_k : undefined,
+        'model': body.model,
+        'prompt': body.input,
+        'max_tokens': body.max_length,
+        // Always stream upstream; non-streaming callers get the deltas collected below.
+        'stream': true,
+        'temperature': clamp(body.temperature, 0, 2, 1),
+        'top_p': (typeof body.top_p === 'number' && body.top_p > 0 && body.top_p <= 1) ? body.top_p : 1,
+        'top_k': (typeof body.top_k === 'number' && body.top_k > 0) ? body.top_k : undefined,
+        'min_p': clamp(body.min_p, 0, 1, 0),
+        'repetition_penalty': clamp(body.repetition_penalty, 1, 1.5, 1),
+        'frequency_penalty': clamp(body.repetition_penalty_frequency, -2, 2, 0),
+        'presence_penalty': clamp(body.repetition_penalty_presence, -2, 2, 0),
+        'stop': stop.length ? stop : undefined,
+        'logit_bias': Object.keys(logitBias).length ? logitBias : undefined,
     };
 }
 
 /**
- * Reads a NovelAI chat-completions SSE stream to completion and concatenates the text deltas.
- * Used when the caller asked for a non-streaming response from a chat model (see the
- * 'stream': true comment above) - we still have to consume it as a stream on our end.
+ * Reads a NovelAI OpenAI-compatible SSE stream to completion and concatenates the text.
+ * Used when the caller asked for a non-streaming response from a GLM model - we still
+ * have to consume it as a stream on our end.
  * @param {import('node-fetch').Response} response Upstream fetch response with an SSE body
  * @returns {Promise<string>} The fully concatenated completion text
  */
@@ -150,7 +176,7 @@ async function collectChatCompletionDeltas(response) {
 
         try {
             const json = JSON.parse(payload);
-            text += json?.choices?.[0]?.delta?.content ?? '';
+            text += json?.choices?.[0]?.text ?? json?.choices?.[0]?.delta?.content ?? '';
         } catch (error) {
             console.warn('Failed to parse NovelAI chat completion chunk', error);
         }
@@ -261,21 +287,11 @@ router.post('/generate', async function (req, res) {
 
     const repPenWhitelist = getRepPenaltyWhitelist(req.body.model);
 
-    // GLM-4.6 and Xialong are only served through NovelAI's OpenAI-compatible chat endpoint,
+    // GLM-4.6 and Xialong are only served through NovelAI's OpenAI-compatible endpoints,
     // not the classic /ai/generate completion endpoint used by every other model.
     const isChatModel = req.body.model === 'glm-4-6' || req.body.model === 'xialong-v1';
 
-    const data = isChatModel ? {
-        'model': req.body.model,
-        'messages': [{ 'role': 'user', 'content': req.body.input }],
-        'max_tokens': req.body.max_length,
-        // NovelAI's chat endpoint only fills in the completion text on streamed deltas; a
-        // non-streamed request comes back with an empty `text` field and just the raw
-        // `token_ids`. Always stream upstream and, if the caller asked for a non-streaming
-        // response, collect the deltas into one string ourselves (see below).
-        'stream': true,
-        ...getChatSamplingParams(req.body.temperature, req.body.top_p, req.body.top_k),
-    } : {
+    const data = isChatModel ? getGlmCompletionData(req.body) : {
         'input': req.body.input,
         'model': req.body.model,
         'parameters': {
@@ -334,7 +350,7 @@ router.post('/generate', async function (req, res) {
     try {
         const baseURL = (req.body.model.includes('kayra') || req.body.model.includes('erato') || isChatModel) ? TEXT_NOVELAI : API_NOVELAI;
         const url = isChatModel
-            ? `${baseURL}/oa/v1/chat/completions`
+            ? `${baseURL}/oa/v1/completions`
             : (req.body.streaming ? `${baseURL}/ai/generate-stream` : `${baseURL}/ai/generate`);
         const response = await fetch(url, { method: 'POST', ...args });
 

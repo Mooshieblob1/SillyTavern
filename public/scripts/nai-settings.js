@@ -57,6 +57,7 @@ export const nai_settings = {
     model_novel: 'clio-v1',
     preset_settings_novel: 'Talker-Chat-Clio',
     streaming_novel: false,
+    ban_ai_punctuation: true,
     preamble: default_preamble,
     prefix: '',
     banned_tokens: '',
@@ -266,6 +267,7 @@ export function loadNovelSettings(data, settings) {
     nai_settings.mirostat_lr = settings.mirostat_lr;
     nai_settings.mirostat_tau = settings.mirostat_tau;
     nai_settings.streaming_novel = !!settings.streaming_novel;
+    nai_settings.ban_ai_punctuation = settings.ban_ai_punctuation ?? true;
     nai_settings.preamble = settings.preamble || default_preamble;
     nai_settings.prefix = settings.prefix;
     nai_settings.banned_tokens = settings.banned_tokens || '';
@@ -323,6 +325,7 @@ function loadNovelSettingsUi(ui_settings) {
     $(`#settings_preset_novel option[value=${novelai_setting_names[nai_settings.preset_settings_novel]}]`).prop('selected', true);
 
     $('#streaming_novel').prop('checked', ui_settings.streaming_novel);
+    $('#ban_ai_punctuation_novel').prop('checked', ui_settings.ban_ai_punctuation ?? true);
     sortItemsByOrder(ui_settings.order);
     displayLogitBias(ui_settings.logit_bias, BIAS_KEY);
 }
@@ -618,6 +621,9 @@ export function getNovelGenerationData(finalPrompt, settings, maxLength, isImper
         'prefix': prefix,
         'order': nai_settings.order || settings.order || default_order,
         'num_logprobs': power_user.request_token_probabilities ? 10 : undefined,
+        // GLM-4.6 / Xialong take plain stop strings and a server-side punctuation ban
+        'stop_strings': isNovelChatModel(nai_settings.model_novel) ? stoppingStrings : undefined,
+        'ban_ai_punctuation': isNovelChatModel(nai_settings.model_novel) ? !!nai_settings.ban_ai_punctuation : undefined,
     };
 }
 
@@ -778,7 +784,7 @@ export async function generateNovelWithStreaming(generate_data, signal) {
             const { done, value } = await reader.read();
             if (done) return;
 
-            // The chat-completions endpoint terminates the stream with a literal "[DONE]" payload, not JSON.
+            // The OpenAI-compatible endpoints terminate the stream with a literal "[DONE]" payload, not JSON.
             if (isChatModel && value.data === '[DONE]') {
                 continue;
             }
@@ -786,7 +792,7 @@ export async function generateNovelWithStreaming(generate_data, signal) {
             const data = JSON.parse(value.data);
 
             if (isChatModel) {
-                text += data?.choices?.[0]?.delta?.content ?? '';
+                text += data?.choices?.[0]?.text ?? data?.choices?.[0]?.delta?.content ?? '';
             } else if (data.token) {
                 text += data.token;
             }
@@ -921,6 +927,11 @@ export function initNovelAISettings() {
     $('#streaming_novel').on('input', function () {
         const value = !!$(this).prop('checked');
         nai_settings.streaming_novel = value;
+        saveSettingsDebounced();
+    });
+
+    $('#ban_ai_punctuation_novel').on('input', function () {
+        nai_settings.ban_ai_punctuation = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
 

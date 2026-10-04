@@ -6019,7 +6019,8 @@ function parseTokenCounts(counts, thisPromptBits) {
 }
 
 function addChatsPreamble(mesSendString) {
-    return main_api === 'novel'
+    // GLM-4.6 / Xialong aren't trained on NovelAI's style preamble; in testing it made chat replies collapse to a few words
+    return main_api === 'novel' && !isNovelChatModel(nai_settings.model_novel)
         ? substituteParams(nai_settings.preamble) + '\n' + mesSendString
         : mesSendString;
 }
