@@ -24,8 +24,8 @@ import { SECRET_KEYS, secret_state, writeSecret } from './secrets.js';
 const default_preamble = '[ Style: chat, complex, sensory, visceral ]';
 const default_order = [1, 5, 0, 2, 3, 4];
 const maximum_output_length = 150;
-// GLM-4.6 / Xialong: NovelAI's site allows up to 4096 characters per generation (~1024 tokens)
-const chat_model_max_output_length = 1024;
+// GLM-4.6 / Xialong: the chat endpoint honors max_tokens up to at least 2048 (tested); matches the slider max
+const chat_model_max_output_length = 2048;
 const default_presets = {
     'clio-v1': 'Talker-Chat-Clio',
     'kayra-v1': 'Carefree-Kayra',
