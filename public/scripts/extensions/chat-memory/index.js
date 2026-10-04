@@ -82,10 +82,14 @@ async function ensureBook(name) {
 }
 
 /**
- * A lorebook is shared if it's active globally or is any character's main lorebook.
+ * A lorebook is shared curated lore if it's active globally or is any character's main
+ * lorebook. Memory books are never treated as shared, wherever the user binds them.
  * @param {string} name Lorebook name
  */
 function isSharedBook(name) {
+    if (String(name).startsWith('Memory - ')) {
+        return false;
+    }
     return !!world_info.globalSelect?.includes(name)
         || characters.some(c => c?.data?.extensions?.world === name);
 }
@@ -240,7 +244,10 @@ async function callNovelAI(messages, { model, maxTokens, temperature }) {
 
     if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data?.error?.message || `HTTP ${response.status}`);
+        const error = new Error(data?.error?.message || `HTTP ${response.status}`);
+        // The server cancelled this for one of the user's generations; retry later, quietly
+        error['preempted'] = !!data?.error?.preempted;
+        throw error;
     }
 
     const { output } = await response.json();
@@ -415,6 +422,10 @@ async function maybeCondense(force = false, quiet = false) {
             total += count;
             if (count && !quiet && settings().notify) toastr.info(`Merged ${count} older memories into the summary.`, `Condensed ${kind} memories`);
         } catch (error) {
+            if (error.preempted) {
+                // Cancelled for a user generation; it runs again after the next saved memory
+                return total;
+            }
             console.warn('[Chat Memory]', error);
             if (!quiet) toastr.warning(String(error.message), 'Memory condensing');
         }
@@ -512,6 +523,10 @@ async function runMemory({ manual = false, scope = null, quiet = false } = {}) {
         }
         return summary;
     } catch (error) {
+        if (error.preempted) {
+            setStatus('Paused for your generation; will continue after the next reply.');
+            return '';
+        }
         console.error('[Chat Memory] Update failed', error);
         setStatus(`Last update failed: ${error.message}`);
         if (!quiet) toastr.warning(String(error.message), 'Memory update failed');

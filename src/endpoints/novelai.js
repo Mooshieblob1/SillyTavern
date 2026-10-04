@@ -151,6 +151,59 @@ function getGlmCompletionData(body) {
     };
 }
 
+/*
+ * NovelAI allows one text generation at a time per account ("Concurrent generation is locked").
+ * Foreground requests (the user's replies, continues, impersonations) take priority: they cancel
+ * any background request (memory extraction) in flight, and background requests wait for them.
+ */
+/** @type {Map<string, { foreground: number, background: AbortController|null }>} */
+const novelGenerationState = new Map();
+
+function getGenerationState(apiKey) {
+    if (!novelGenerationState.has(apiKey)) {
+        novelGenerationState.set(apiKey, { foreground: 0, background: null });
+    }
+    return novelGenerationState.get(apiKey);
+}
+
+/**
+ * Marks a foreground generation as running and cancels any background one.
+ * @param {string} apiKey NovelAI key
+ * @returns {() => void} Call when the generation is finished
+ */
+function beginForegroundGeneration(apiKey) {
+    const state = getGenerationState(apiKey);
+    state.foreground++;
+    state.background?.abort();
+    let released = false;
+    return () => {
+        if (!released) {
+            released = true;
+            state.foreground--;
+        }
+    };
+}
+
+/**
+ * Fetches from NovelAI, retrying while the account's generation lock is held
+ * (another request still finishing, another tab, or the NovelAI website).
+ * @param {string} url Request URL
+ * @param {object} options Fetch options, including the abort signal
+ * @param {number} attempts Total attempts
+ * @returns {Promise<import('node-fetch').Response>}
+ */
+async function fetchNovelWithRetry(url, options, attempts) {
+    for (let attempt = 1; ; attempt++) {
+        const response = await fetch(url, options);
+        if (response.status !== 429 || attempt >= attempts || options.signal?.aborted) {
+            return response;
+        }
+        await response.text();
+        console.info(`NovelAI generation is locked, retrying (${attempt}/${attempts - 1})`);
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+    }
+}
+
 /**
  * Reads a NovelAI OpenAI-compatible SSE stream to completion and concatenates the text.
  * Used when the caller asked for a non-streaming response from a GLM model - we still
@@ -347,12 +400,14 @@ router.post('/generate', async function (req, res) {
         signal: controller.signal,
     };
 
+    const releaseGeneration = beginForegroundGeneration(api_key_novel);
     try {
         const baseURL = (req.body.model.includes('kayra') || req.body.model.includes('erato') || isChatModel) ? TEXT_NOVELAI : API_NOVELAI;
         const url = isChatModel
             ? `${baseURL}/oa/v1/completions`
             : (req.body.streaming ? `${baseURL}/ai/generate-stream` : `${baseURL}/ai/generate`);
-        const response = await fetch(url, { method: 'POST', ...args });
+        // 1+2+3+4+5 s of retries covers a cancelled background request releasing the lock
+        const response = await fetchNovelWithRetry(url, { method: 'POST', ...args }, 6);
 
         if (req.body.streaming) {
             // Pipe remote SSE stream to Express response
@@ -389,6 +444,8 @@ router.post('/generate', async function (req, res) {
         }
     } catch (error) {
         return res.send({ error: true });
+    } finally {
+        releaseGeneration();
     }
 });
 
@@ -417,9 +474,23 @@ router.post('/chat-completion', async function (req, res) {
         }
     }
 
+    // Background request: wait for the user's generations to finish, and get cancelled by new ones
+    const state = getGenerationState(apiKey);
+    for (let waited = 0; state.foreground > 0; waited += 500) {
+        if (waited >= 60000) {
+            return res.status(409).send({ error: { message: 'NovelAI is busy with a generation.', preempted: true } });
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+    }
+    state.background?.abort();
+    const controller = new AbortController();
+    state.background = controller;
+    req.socket.on('close', () => controller.abort());
+
     try {
-        const response = await fetch(`${TEXT_NOVELAI}/oa/v1/chat/completions`, {
+        const response = await fetchNovelWithRetry(`${TEXT_NOVELAI}/oa/v1/chat/completions`, {
             method: 'POST',
+            signal: controller.signal,
             headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey },
             body: JSON.stringify({
                 model,
@@ -430,7 +501,7 @@ router.post('/chat-completion', async function (req, res) {
                 temperature: Math.min(Math.max(Number(req.body.temperature ?? 0.3), 0), 2),
                 logit_bias: Object.keys(logitBias).length ? logitBias : undefined,
             }),
-        });
+        }, 3);
 
         if (!response.ok) {
             const text = await response.text();
@@ -440,8 +511,16 @@ router.post('/chat-completion', async function (req, res) {
 
         return res.send({ output: await collectChatCompletionDeltas(response) });
     } catch (error) {
+        if (controller.signal.aborted) {
+            console.info('NovelAI background request cancelled for a user generation');
+            return res.status(409).send({ error: { message: 'Cancelled for a user generation.', preempted: true } });
+        }
         console.error('NovelAI chat completion error', error);
         return res.status(500).send({ error: { message: String(error) } });
+    } finally {
+        if (state.background === controller) {
+            state.background = null;
+        }
     }
 });
 
