@@ -369,7 +369,7 @@ export function initDefaultSlashCommands() {
             return '';
         }
         ,
-        aliases: ['imp'],
+        aliases: ['imp', 'i'],
         namedArgumentList: [
             new SlashCommandNamedArgument(
                 'await',
