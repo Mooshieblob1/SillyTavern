@@ -41,6 +41,11 @@ const CHUNK_CHARS = 16000;
 // Existing memories shown to the model so it doesn't repeat them
 const MAX_EXISTING = 120;
 
+const SUMMARY_COMMENT = 'Memory summary';
+const CONDENSED_PREFIX = 'Condensed:';
+// Word limits for summaries; the model drops minor details to stay within them
+const SUMMARY_WORDS = { chat: 300, character: 250 };
+
 const defaultSettings = {
     auto: true,
     interval: 6,
@@ -48,6 +53,11 @@ const defaultSettings = {
     model: 'xialong-v1',
     showButton: true,
     notify: true,
+    condense: true,
+    condenseAt: 60,
+    keepRecent: 20,
+    // Xialong is a story model and once continued the story past the memories; GLM-4.6 follows instructions
+    condenseModel: 'glm-4-6',
 };
 
 let running = false;
@@ -216,20 +226,16 @@ function buildPrompt(lines, existing, askScope) {
 }
 
 /**
- * Asks NovelAI for new memories.
- * @returns {Promise<{ text: string, scope: string }[]>}
+ * One-shot NovelAI chat completion.
+ * @param {{ role: string, content: string }[]} messages
+ * @param {{ model: string, maxTokens: number, temperature: number }} options
+ * @returns {Promise<string>} Reply text without reasoning blocks
  */
-async function extractMemories(lines, existing, askScope) {
+async function callNovelAI(messages, { model, maxTokens, temperature }) {
     const response = await fetch('/api/novelai/chat-completion', {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify({
-            model: settings().model,
-            messages: buildPrompt(lines, existing, askScope),
-            max_tokens: 800,
-            temperature: 0.3,
-            ban_ai_punctuation: true,
-        }),
+        body: JSON.stringify({ model, messages, max_tokens: maxTokens, temperature, ban_ai_punctuation: true }),
     });
 
     if (!response.ok) {
@@ -238,7 +244,18 @@ async function extractMemories(lines, existing, askScope) {
     }
 
     const { output } = await response.json();
-    const json = String(output ?? '');
+    return String(output ?? '')
+        .replace(/<think>[\s\S]*?<\/think>/g, '')
+        .replace(/^[\s\S]*<\/think>/, '')
+        .trim();
+}
+
+/**
+ * Asks NovelAI for new memories.
+ * @returns {Promise<{ text: string, scope: string }[]>}
+ */
+async function extractMemories(lines, existing, askScope) {
+    const json = await callNovelAI(buildPrompt(lines, existing, askScope), { model: settings().model, maxTokens: 800, temperature: 0.3 });
     const parsed = JSON.parse(json.slice(json.indexOf('['), json.lastIndexOf(']') + 1));
     if (!Array.isArray(parsed)) {
         throw new Error('NovelAI did not return a list');
@@ -282,6 +299,127 @@ async function addToBook(book, texts) {
 
     await saveWorldInfo(book, data, true);
     reloadEditor(book);
+}
+
+function isMemoryEntry(entry) {
+    return !entry.disable && String(entry.comment ?? '').startsWith(MEMORY_COMMENT_PREFIX);
+}
+
+function isSummaryEntry(entry) {
+    return !entry.disable && String(entry.comment ?? '').startsWith(SUMMARY_COMMENT);
+}
+
+function buildCondensePrompt(kind, summary, memories) {
+    const limit = SUMMARY_WORDS[kind];
+    const task = kind === 'character'
+        ? 'Merge the existing summary (if any) and the older memories into one concise list of lasting facts about the characters. One fact per line, starting with "- ". Combine duplicates.'
+        : 'Merge the existing summary (if any) and the older memories into one updated summary of the story so far.';
+    const system = [
+        `You condense a roleplay's long-term memory. ${task}`,
+        'Rules:',
+        '- Keep every important fact: events, decisions, promises, relationships, items gained or lost, injuries, secrets, places and names.',
+        kind === 'character' ? '- If two facts conflict, keep only the later one.' : '- Keep chronological order. If two facts conflict, the later one is true.',
+        '- Never add, guess or embellish anything that isn\'t in the input. Do not continue the story.',
+        '- Drop only minor details with no lasting consequence.',
+        '- Past tense, third person, plain punctuation. No em dashes.',
+        `- At most ${limit} words. Shorten by merging related items.`,
+        'Reply with only the summary text.',
+    ].join('\n');
+    const user = [
+        'Existing summary:',
+        summary?.trim() || '(none)',
+        '',
+        'Older memories, oldest first:',
+        memories.map(m => `- ${m}`).join('\n'),
+    ].join('\n');
+    return [{ role: 'system', content: system }, { role: 'user', content: user }];
+}
+
+/**
+ * Rejects summaries that look invented: too long, longer than the input, or naming
+ * someone or something (a capitalized word mid-sentence) that the input never mentioned.
+ * @returns {string|null} Reason for rejection, or null if it looks faithful
+ */
+function checkSummary(summary, input, kind) {
+    const words = summary.split(/\s+/).filter(Boolean).length;
+    if (words < 5) return 'summary was empty';
+    if (words > SUMMARY_WORDS[kind] * 1.6) return `summary was too long (${words} words)`;
+    if (summary.length > input.length) return 'summary was longer than the memories it replaces';
+    const known = new Set(input.match(/\b[A-Z][a-zA-Z']+\b/g) ?? []);
+    const midSentenceNames = [...summary.matchAll(/(?<![.!?:"]\s|^|\n|- )\b([A-Z][a-zA-Z']+)\b/g)].map(m => m[1]);
+    const invented = [...new Set(midSentenceNames.filter(name => !known.has(name)))];
+    if (invented.length) return `summary introduced names not in the memories: ${invented.join(', ')}`;
+    return null;
+}
+
+/**
+ * Merges the oldest memories in a lorebook into a single summary entry once the book is
+ * over the threshold. Condensed memories are disabled and relabelled, not deleted.
+ * @param {string} book Lorebook name
+ * @param {'chat'|'character'} kind Summary style
+ * @param {boolean} force Condense even if under the threshold
+ * @returns {Promise<number>} Number of memories condensed
+ */
+async function condenseBook(book, kind, force = false) {
+    if (!book) return 0;
+
+    const data = structuredClone(await loadWorldInfo(book) ?? { entries: {} });
+    const memories = Object.values(data.entries).filter(isMemoryEntry).sort((a, b) => a.order - b.order);
+    const keep = settings().keepRecent;
+    if (!force && memories.length <= settings().condenseAt) return 0;
+
+    const old = memories.slice(0, Math.max(0, memories.length - keep));
+    if (old.length < 2) return 0;
+
+    let summaryEntry = Object.values(data.entries).find(isSummaryEntry);
+    const messages = buildCondensePrompt(kind, summaryEntry?.content, old.map(e => e.content));
+    const summary = await callNovelAI(messages, { model: settings().condenseModel, maxTokens: 1200, temperature: 0.2 });
+
+    const problem = checkSummary(summary, messages[1].content, kind);
+    if (problem) {
+        throw new Error(`Condensing "${book}" skipped: ${problem}. Old memories were left as they are.`);
+    }
+
+    if (!summaryEntry) {
+        summaryEntry = createWorldInfoEntry(book, data);
+        Object.assign(summaryEntry, { key: [], constant: true, position: world_info_position.after, addMemo: true });
+    }
+    for (const entry of old) {
+        data.entries[entry.uid].disable = true;
+        data.entries[entry.uid].comment = String(entry.comment).replace(MEMORY_COMMENT_PREFIX, CONDENSED_PREFIX);
+    }
+    const condensedCount = Object.values(data.entries).filter(e => String(e.comment ?? '').startsWith(CONDENSED_PREFIX)).length;
+    Object.assign(data.entries[summaryEntry.uid], {
+        content: summary,
+        comment: `${SUMMARY_COMMENT} (${condensedCount} memories condensed)`,
+        // Before the remaining memories, so the prompt reads summary first, then recent events
+        order: Math.min(summaryEntry.order ?? Infinity, Math.min(...memories.map(e => e.order)) - 1),
+    });
+
+    await saveWorldInfo(book, data, true);
+    reloadEditor(book);
+    return old.length;
+}
+
+/**
+ * Condenses the chat and character memory books if they're over the threshold.
+ * @param {boolean} force Condense regardless of the threshold
+ * @param {boolean} quiet Don't show notifications
+ */
+async function maybeCondense(force = false, quiet = false) {
+    if (!force && !settings().condense) return 0;
+    let total = 0;
+    for (const [book, kind] of [[await getChatBook(false), 'chat'], [await getCharacterBook(false), 'character']]) {
+        try {
+            const count = await condenseBook(book, /** @type {'chat'|'character'} */ (kind), force);
+            total += count;
+            if (count && !quiet && settings().notify) toastr.info(`Merged ${count} older memories into the summary.`, `Condensed ${kind} memories`);
+        } catch (error) {
+            console.warn('[Chat Memory]', error);
+            if (!quiet) toastr.warning(String(error.message), 'Memory condensing');
+        }
+    }
+    return total;
 }
 
 /**
@@ -360,6 +498,11 @@ async function runMemory({ manual = false, scope = null, quiet = false } = {}) {
             await saveMetadata();
         }
 
+        if (saved.length) {
+            setStatus('Condensing older memories...');
+            await maybeCondense(false, quiet);
+        }
+
         const summary = saved.length ? `Remembered ${saved.length}: ${saved.map(m => m.text).join(' | ')}` : 'Nothing new to remember.';
         setStatus(saved.length ? `Last update: ${saved.length} new memories.` : 'Last update: nothing new.');
         if (!quiet && saved.length && settings().notify) {
@@ -391,7 +534,35 @@ async function saveDirect(text, scope) {
     const book = destination === 'character' ? await getCharacterBook(true) : await getChatBook(true);
     await addToBook(book, [text.trim()]);
     if (settings().notify) toastr.info(text.trim(), 'Remembered');
+    await maybeCondense(false, false);
     return `Saved to ${book}`;
+}
+
+/**
+ * Condenses both memory books now, regardless of the threshold.
+ * @returns {Promise<string>} Result summary
+ */
+async function condenseNow() {
+    if (running) {
+        toastr.info('Memory is already being updated.');
+        return '';
+    }
+    if (!getCurrentChatId()) {
+        return '';
+    }
+    running = true;
+    $('#chat_memory_button').addClass('chat_memory_running');
+    setStatus('Condensing memories...');
+    try {
+        const count = await maybeCondense(true, false);
+        const result = count ? `Condensed ${count} memories.` : `Nothing to condense (books keep the newest ${settings().keepRecent} memories as they are).`;
+        setStatus(result);
+        if (!count) toastr.info(result);
+        return result;
+    } finally {
+        running = false;
+        $('#chat_memory_button').removeClass('chat_memory_running');
+    }
 }
 
 function onMessageReceived() {
@@ -418,6 +589,10 @@ function loadSettingsUi() {
     $('#chat_memory_model').val(s.model);
     $('#chat_memory_show_button').prop('checked', s.showButton);
     $('#chat_memory_notify').prop('checked', s.notify);
+    $('#chat_memory_condense').prop('checked', s.condense);
+    $('#chat_memory_condense_at').val(s.condenseAt);
+    $('#chat_memory_keep_recent').val(s.keepRecent);
+    $('#chat_memory_condense_model').val(s.condenseModel);
 }
 
 async function openBook(getBook) {
@@ -461,6 +636,23 @@ export async function init() {
         settings().notify = !!$(this).prop('checked');
         saveSettingsDebounced();
     });
+    $('#chat_memory_condense').on('input', function () {
+        settings().condense = !!$(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#chat_memory_condense_at').on('input', function () {
+        settings().condenseAt = Math.min(Math.max(Number($(this).val()) || defaultSettings.condenseAt, 10), 500);
+        saveSettingsDebounced();
+    });
+    $('#chat_memory_keep_recent').on('input', function () {
+        settings().keepRecent = Math.min(Math.max(Number($(this).val()) || defaultSettings.keepRecent, 0), 200);
+        saveSettingsDebounced();
+    });
+    $('#chat_memory_condense_model').on('change', function () {
+        settings().condenseModel = String($(this).val());
+        saveSettingsDebounced();
+    });
+    $('#chat_memory_condense_now').on('click', () => condenseNow());
     $('#chat_memory_run').on('click', () => runMemory({ manual: true }));
     $('#chat_memory_open_chat').on('click', () => openBook(getChatBook));
     $('#chat_memory_open_char').on('click', () => openBook(getCharacterBook));
@@ -493,6 +685,13 @@ export async function init() {
             new SlashCommandArgument('text to save as a memory directly (optional)', [ARGUMENT_TYPE.STRING], false),
         ],
         helpString: 'Saves new events and facts from this chat as memories using NovelAI. With text, saves that text as a memory directly.',
+        returns: ARGUMENT_TYPE.STRING,
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'condense',
+        callback: async () => await condenseNow(),
+        helpString: 'Merges older memories in this chat\'s and character\'s memory lorebooks into a summary entry, keeping the newest ones as they are.',
         returns: ARGUMENT_TYPE.STRING,
     }));
 }
