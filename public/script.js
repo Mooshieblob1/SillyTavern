@@ -3572,6 +3572,8 @@ class StreamingProcessor {
         this.timeToFirstToken = null;
         this.createdAt = new Date();
         this.continueMessage = type === 'continue' ? continueMessage : '';
+        /** Text the user typed before impersonating; the generation continues it */
+        this.impersonatePrefill = '';
         this.swipes = [];
         /** @type {import('./scripts/logprobs.js').TokenLogprobs[]} */
         this.messageLogprobs = [];
@@ -3628,7 +3630,7 @@ class StreamingProcessor {
         let messageId = -1;
 
         if (this.type == 'impersonate') {
-            this.sendTextarea.value = '';
+            this.sendTextarea.value = this.impersonatePrefill;
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
             await saveReply({ type: this.type, getMessage: text, fromStreaming: true });
@@ -3674,7 +3676,7 @@ class StreamingProcessor {
         }
 
         if (isImpersonate) {
-            this.sendTextarea.value = processedText;
+            this.sendTextarea.value = joinImpersonatePrefill(this.impersonatePrefill, text, processedText);
             this.sendTextarea.dispatchEvent(new Event('input', { bubbles: true }));
         } else {
             const mesChanged = chat[messageId].mes !== processedText;
@@ -4396,6 +4398,11 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
     const lastMessage = chat[chat.length - 1];
 
+    // Impersonate continues whatever the user already typed (text completion only; chat completion builds its own prompt)
+    const impersonatePrefill = isImpersonate && !dryRun && main_api !== 'openai'
+        ? String($('#send_textarea').val()).trim()
+        : '';
+
     let textareaText;
     if (type !== 'regenerate' && type !== 'swipe' && type !== 'quiet' && !isImpersonate && !dryRun && !depth) {
         is_send_press = true;
@@ -5065,6 +5072,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             const name = (quiet_prompt && !quietToLoud && !isImpersonate) ? (quietName ?? 'System') : (isImpersonate ? name1 : name2);
             const isQuiet = quiet_prompt && type == 'quiet';
             lastMesString += formatInstructModePrompt(name, isImpersonate, promptBias, name1, name2, isQuiet, quietToLoud);
+            if (isImpersonate && impersonatePrefill) {
+                lastMesString += impersonatePrefill;
+            }
         }
 
         // Get non-instruct impersonation line
@@ -5078,6 +5088,9 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
                 lastMesString += substituteParams(nai_settings.impersonation_hint.trim()) + '\n';
             }
             lastMesString += name + ':';
+            if (impersonatePrefill) {
+                lastMesString += ' ' + impersonatePrefill;
+            }
         }
 
         // Add character's name
@@ -5390,6 +5403,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         if (isStreamingEnabled() && type !== 'quiet') {
             continue_mag = promptReasoning.removePrefix(continue_mag);
             streamingProcessor = new StreamingProcessor(type, force_name2, generation_started, continue_mag, promptReasoning);
+            streamingProcessor.impersonatePrefill = impersonatePrefill;
             if (isContinue) {
                 // Save reply does add cycle text to the prompt, so it's not needed here
                 streamingProcessor.firstMessageText = '';
@@ -5518,6 +5532,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
 
         //Formating
         const displayIncomplete = type === 'quiet' && !quietToLoud;
+        const rawMessage = getMessage;
         getMessage = cleanUpMessage({
             getMessage: getMessage,
             isImpersonate: isImpersonate,
@@ -5526,6 +5541,7 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
         });
 
         if (isImpersonate) {
+            getMessage = joinImpersonatePrefill(impersonatePrefill, rawMessage, getMessage);
             $('#send_textarea').val(getMessage)[0].dispatchEvent(new Event('input', { bubbles: true }));
             await eventSource.emit(event_types.IMPERSONATE_READY, getMessage);
         } else if (type == 'quiet') {
@@ -6452,6 +6468,25 @@ function extractMultiSwipes(data, type) {
  *
  * @returns {string} The formatted message
  */
+/**
+ * Joins the text the user typed before impersonating with the generated continuation.
+ * Impersonated output is trimmed during clean-up, so the separator comes from the raw text's
+ * leading whitespace: none means the model continued mid-word or mid-sentence.
+ * @param {string} prefill Text from the input box when impersonation started
+ * @param {string} rawText Generated text before clean-up
+ * @param {string} cleanText Generated text after clean-up
+ * @returns {string} Combined text for the input box
+ */
+function joinImpersonatePrefill(prefill, rawText, cleanText) {
+    if (!prefill) {
+        return cleanText;
+    }
+
+    const leading = /^\s*/.exec(String(rawText ?? ''))[0];
+    const separator = leading.includes('\n') ? leading.replace(/[^\n]/g, '') : (leading ? ' ' : '');
+    return cleanText ? prefill + separator + cleanText : prefill;
+}
+
 export function cleanUpMessage({ getMessage, isImpersonate, isContinue, displayIncompleteSentences = false, stoppingStrings = null, includeUserPromptBias = true, trimNames = true, trimWrongNames = true } = {}) {
     if (arguments.length > 0 && typeof arguments[0] !== 'object') {
         console.trace('cleanUpMessage called with positional arguments. Please use an object instead.');
