@@ -33,21 +33,68 @@ async function parseOllamaStream(jsonStream, request, response) {
         }
 
         let partialData = '';
-        jsonStream.body.on('data', (data) => {
-            const chunk = data.toString();
-            partialData += chunk;
-            while (true) {
-                let json;
-                try {
-                    json = JSON.parse(partialData);
-                } catch (e) {
-                    break;
+        let accText = '';
+        let accThinking = '';
+        /**
+         * Handle one parsed NDJSON object from Ollama.
+         * @param {any} json
+         */
+        const handleJson = (json) => {
+            // /api/generate → response/thinking
+            // /api/chat     → message.content / message.thinking
+            const msg = json.message || {};
+            const text = json.response || msg.content || '';
+            const thinking = json.thinking || msg.thinking || '';
+            accText += text;
+            accThinking += thinking;
+
+            // On final chunk: if response stayed empty but thinking holds
+            // narrative prose (not a one-line plan), promote it to text so
+            // ST doesn't render a blank chat bubble.
+            if (json.done) {
+                if (!String(accText).trim() && String(accThinking).trim()) {
+                    const t = String(accThinking).trim();
+                    const looksLikePlan = /^(day\s*one|scene|beat|plan|outline|director|follow prior|soft offer)\b/i.test(t)
+                        || (t.length < 120 && !/[.!?*"“]/.test(t));
+                    if (!looksLikePlan) {
+                        const out = { choices: [{ text: accThinking, thinking: '' }] };
+                        response.write(`data: ${JSON.stringify(out)}\n\n`);
+                        return;
+                    }
                 }
-                const text = json.response || '';
-                const thinking = json.thinking || '';
-                const chunk = { choices: [{ text, thinking }] };
-                response.write(`data: ${JSON.stringify(chunk)}\n\n`);
-                partialData = '';
+            }
+
+            const out = { choices: [{ text, thinking }] };
+            response.write(`data: ${JSON.stringify(out)}\n\n`);
+        };
+
+        /**
+         * Parse one NDJSON line, if it is complete and valid.
+         * @param {string} line
+         */
+        const handleLine = (line) => {
+            const trimmed = line.trim();
+            if (!trimmed) return;
+            let json;
+            try {
+                json = JSON.parse(trimmed);
+            } catch {
+                console.warn('Ollama stream: skipping unparseable line:', trimmed.slice(0, 200));
+                return;
+            }
+            handleJson(json);
+        };
+
+        // Ollama emits NDJSON. A single TCP chunk may carry several lines
+        // (observed with cloud models), so split on newlines instead of
+        // JSON.parse-ing the whole buffer — the latter throws on multi-line
+        // chunks and silently drops the rest of the stream.
+        jsonStream.body.on('data', (data) => {
+            partialData += data.toString();
+            const lines = partialData.split('\n');
+            partialData = lines.pop() ?? '';
+            for (const line of lines) {
+                handleLine(line);
             }
         });
 
@@ -316,6 +363,10 @@ router.post('/generate', async function (request, response) {
                 url += '/completion';
                 break;
             case TEXTGEN_TYPES.OLLAMA:
+                // /api/generate with raw:false — Ollama applies the model template.
+                // raw:true made GLM-5.x put the reply into `thinking` and leave
+                // `response` empty. /api/chat with ST's full text blob as one user
+                // message made it emit only a short plan in thinking and empty content.
                 url += '/api/generate';
                 break;
             case TEXTGEN_TYPES.OPENROUTER:
@@ -388,14 +439,32 @@ router.post('/generate', async function (request, response) {
             if (numBatch > 0) {
                 request.body.num_batch = numBatch;
             }
-            args.body = JSON.stringify({
+            // GLM-5.x / thinking models on Ollama:
+            // - raw MUST be false so the model chat template is applied
+            // - think:"low" keeps CoT short so num_predict has room for the reply
+            // - append a hard "write the reply" cue; without it cloud GLM often
+            //   stops after a one-line plan in `thinking` with empty `response`
+            const options = _.pickBy(request.body, (_, key) => OLLAMA_KEYS.includes(key));
+            let think;
+            if (Object.prototype.hasOwnProperty.call(request.body, 'think')) {
+                think = request.body.think;
+            } else if (request.body.include_reasoning === false) {
+                think = false;
+            } else {
+                think = 'low';
+            }
+            const basePrompt = String(request.body.prompt ?? '');
+            const writeCue = '\n\nWrite the complete in-character reply now. After thinking, output only the scene/dialogue text — not a plan, outline, or director note.\n';
+            const ollamaBody = {
                 model: request.body.model,
-                prompt: request.body.prompt,
+                prompt: basePrompt + writeCue,
                 stream: request.body.stream ?? false,
                 keep_alive: keepAlive,
-                raw: true,
-                options: _.pickBy(request.body, (_, key) => OLLAMA_KEYS.includes(key)),
-            });
+                raw: false,
+                think,
+                options,
+            };
+            args.body = JSON.stringify(ollamaBody);
         }
 
         if (request.body.api_type === TEXTGEN_TYPES.OLLAMA && request.body.stream) {
@@ -416,6 +485,27 @@ router.post('/generate', async function (request, response) {
                 // Map InfermaticAI response to OAI completions format
                 if (apiType === TEXTGEN_TYPES.INFERMATICAI) {
                     data.choices = (data?.choices || []).map(choice => ({ text: choice?.message?.content || choice.text, logprobs: choice?.logprobs, index: choice?.index }));
+                }
+
+                // Normalize Ollama generate/chat payloads to text-completions shape
+                if (apiType === TEXTGEN_TYPES.OLLAMA) {
+                    const msg = data?.message || {};
+                    let text = data?.response || msg.content || '';
+                    let thinking = data?.thinking || msg.thinking || '';
+                    // Safety net: if the model left response empty but put narrative
+                    // prose in thinking, promote it so ST doesn't show a blank bubble.
+                    if (!String(text).trim() && String(thinking).trim()) {
+                        const t = String(thinking).trim();
+                        const looksLikePlan = /^(day\s*one|scene|beat|plan|outline|director|follow prior|soft offer)\b/i.test(t)
+                            || (t.length < 120 && !/[.!?*"“]/.test(t));
+                        if (!looksLikePlan) {
+                            text = thinking;
+                            thinking = '';
+                        }
+                    }
+                    data.choices = [{ text, thinking, index: 0 }];
+                    data.thinking = thinking;
+                    data.response = text;
                 }
 
                 return response.send(data);
