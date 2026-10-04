@@ -5,6 +5,7 @@ import { chat_completion_sources, model_list, oai_settings } from './openai.js';
 import { groups, selected_group } from './group-chats.js';
 import { getStringHash } from './utils.js';
 import { kai_flags, kai_settings } from './kai-settings.js';
+import { isNovelChatModel } from './nai-settings.js';
 import { textgen_types, textgenerationwebui_settings as textgen_settings, getTextGenServer, getTextGenModel } from './textgen-settings.js';
 import { getCurrentDreamGenModelTokenizer, getCurrentOpenRouterModelTokenizer, openRouterModels } from './textgen-models.js';
 export { BYTES_PER_TOKEN as CHARACTERS_PER_TOKEN_RATIO };
@@ -296,6 +297,10 @@ export function getTokenizerBestMatch(forApi) {
         }
         if (nai_settings.model_novel.includes('erato')) {
             return tokenizers.LLAMA3;
+        }
+        if (isNovelChatModel(nai_settings.model_novel)) {
+            // No GLM tokenizer bundled; Qwen2's ~151k BPE vocab is the closest approximation
+            return tokenizers.QWEN2;
         }
     }
     if (forApi === 'kobold' || forApi === 'textgenerationwebui' || forApi === 'koboldhorde') {

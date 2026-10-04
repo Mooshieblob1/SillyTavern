@@ -117,6 +117,7 @@ import {
     generateNovelWithStreaming,
     getNovelGenerationData,
     getKayraMaxContextTokens,
+    isNovelChatModel,
     loadNovelSettings,
     nai_settings,
     adjustNovelInstructionPrompt,
@@ -5949,6 +5950,13 @@ export function getMaxContextTokens() {
             this_max_context = Math.min(max_context, 8192);
 
             // Added special tokens and whatnot
+            this_max_context -= 10;
+        }
+        if (isNovelChatModel(nai_settings.model_novel)) {
+            // GLM-4.6 / Xialong: 28,672 token context per NovelAI's model docs
+            this_max_context = Math.min(max_context, 28672);
+
+            // Chat template wrapper tokens
             this_max_context -= 10;
         }
         return this_max_context;
