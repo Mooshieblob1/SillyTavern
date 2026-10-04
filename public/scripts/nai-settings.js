@@ -22,6 +22,8 @@ import { BIAS_CACHE, createNewLogitBiasEntry, displayLogitBias, getLogitBiasList
 import { SECRET_KEYS, secret_state, writeSecret } from './secrets.js';
 
 const default_preamble = '[ Style: chat, complex, sensory, visceral ]';
+// Inserted before {{user}}'s line on impersonate (GLM-4.6 / Xialong); without it the model copies {{char}}'s POV and tense
+const default_impersonation_hint = '[ Write {{user}}\'s next message as {{user}}, in first person, present tense. Text in *asterisks* is {{user}}\'s own inner thoughts, also in first person. ]';
 const default_order = [1, 5, 0, 2, 3, 4];
 const maximum_output_length = 150;
 // GLM-4.6 / Xialong: the chat endpoint honors max_tokens up to at least 2048 (tested); matches the slider max
@@ -58,6 +60,7 @@ export const nai_settings = {
     preset_settings_novel: 'Talker-Chat-Clio',
     streaming_novel: false,
     ban_ai_punctuation: true,
+    impersonation_hint: default_impersonation_hint,
     preamble: default_preamble,
     prefix: '',
     banned_tokens: '',
@@ -268,6 +271,7 @@ export function loadNovelSettings(data, settings) {
     nai_settings.mirostat_tau = settings.mirostat_tau;
     nai_settings.streaming_novel = !!settings.streaming_novel;
     nai_settings.ban_ai_punctuation = settings.ban_ai_punctuation ?? true;
+    nai_settings.impersonation_hint = settings.impersonation_hint ?? default_impersonation_hint;
     nai_settings.preamble = settings.preamble || default_preamble;
     nai_settings.prefix = settings.prefix;
     nai_settings.banned_tokens = settings.banned_tokens || '';
@@ -312,6 +316,7 @@ function loadNovelSettingsUi(ui_settings) {
     $('#min_length_novel').val(ui_settings.min_length);
     $('#min_length_counter_novel').val(Number(ui_settings.min_length).toFixed(0));
     $('#nai_preamble_textarea').val(ui_settings.preamble);
+    $('#nai_impersonation_hint_textarea').val(ui_settings.impersonation_hint ?? default_impersonation_hint);
     $('#nai_prefix').val(ui_settings.prefix || 'vanilla');
     $('#nai_banned_tokens').val(ui_settings.banned_tokens || '');
     $('#min_p_novel').val(ui_settings.min_p);
@@ -622,7 +627,8 @@ export function getNovelGenerationData(finalPrompt, settings, maxLength, isImper
         'order': nai_settings.order || settings.order || default_order,
         'num_logprobs': power_user.request_token_probabilities ? 10 : undefined,
         // GLM-4.6 / Xialong take plain stop strings and a server-side punctuation ban
-        'stop_strings': isNovelChatModel(nai_settings.model_novel) ? stoppingStrings : undefined,
+        // On impersonate, also stop at a new bracketed note so the model can't write the next turn's instruction
+        'stop_strings': isNovelChatModel(nai_settings.model_novel) ? (isImpersonate ? [...stoppingStrings, '\n['] : stoppingStrings) : undefined,
         'ban_ai_punctuation': isNovelChatModel(nai_settings.model_novel) ? !!nai_settings.ban_ai_punctuation : undefined,
     };
 }
@@ -869,6 +875,17 @@ $('#nai_preamble_textarea').on('input', function () {
 $('#nai_preamble_restore').on('click', function () {
     nai_settings.preamble = default_preamble;
     $('#nai_preamble_textarea').val(nai_settings.preamble);
+    saveSettingsDebounced();
+});
+
+$('#nai_impersonation_hint_textarea').on('input', function () {
+    nai_settings.impersonation_hint = String($('#nai_impersonation_hint_textarea').val());
+    saveSettingsDebounced();
+});
+
+$('#nai_impersonation_hint_restore').on('click', function () {
+    nai_settings.impersonation_hint = default_impersonation_hint;
+    $('#nai_impersonation_hint_textarea').val(nai_settings.impersonation_hint);
     saveSettingsDebounced();
 });
 

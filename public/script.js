@@ -5073,6 +5073,10 @@ export async function Generate(type, { automatic_trigger, force_name2, quiet_pro
             if (!lastMesString.endsWith('\n')) {
                 lastMesString += '\n';
             }
+            // GLM-4.6 / Xialong otherwise copy {{char}}'s point of view and tense
+            if (main_api === 'novel' && isNovelChatModel(nai_settings.model_novel) && nai_settings.impersonation_hint?.trim()) {
+                lastMesString += substituteParams(nai_settings.impersonation_hint.trim()) + '\n';
+            }
             lastMesString += name + ':';
         }
 
